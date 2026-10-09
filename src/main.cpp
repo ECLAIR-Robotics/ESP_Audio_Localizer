@@ -16,7 +16,7 @@
 #define MODE_ROS        2
 #define MODE            MODE_PRODUCTION
 
-#define CROWDED_AREA    0   // 1 = periodic background xcorr subtraction for noisy environments
+#define CROWDED_AREA    1   // 1 = periodic background xcorr subtraction for noisy environments
 
 // ── Tunable constants ─────────────────────────────────────────────────────────
 // SAMPLES: recording window = SAMPLES / (I2S_SAMPLE_RATE/4) ms. Trade-off:
@@ -38,7 +38,7 @@ static constexpr int    XCORR_RANGE     = 12;
 static constexpr int    VOLTAGE[4]      = {1919, 1913, 1915, 1925};
 
 // THRESHOLD: single-sample abs deviation that fires the recording trigger.
-static constexpr int           THRESHOLD    = 300; //400
+static constexpr int           THRESHOLD    = 50; //400
 // COOLDOWN_MS: silence window after each recording — suppresses echo re-triggers.
 static constexpr unsigned long COOLDOWN_MS  = 200;
 #if CROWDED_AREA
@@ -46,13 +46,24 @@ static constexpr unsigned long COOLDOWN_MS  = 200;
 static constexpr unsigned long BG_UPDATE_MS = 2000;
 // BG_ALPHA: EMA weight applied to each new background estimate (0=never update, 1=instant replace).
 static constexpr float         BG_ALPHA     = 0.5f;
+// CALIBRATION_MS: silent window used to measure ambient noise and set dynamic threshold
+// (run once at startup, then re-run periodically — see RECALIBRATION_MS).
+static constexpr unsigned long CALIBRATION_MS = 2000;
+// CAL_SIGMA_MULT: how many std-devs above the noise mean a sample must deviate to trigger.
+// Lower = more sensitive (more false triggers from noise); higher = less sensitive (misses quieter sounds).
+static constexpr float         CAL_SIGMA_MULT  = 1.5f;
+// CAL_FLOOR_MARGIN: minimum trigger margin above the noise mean, even if std_dev is ~0.
+static constexpr int           CAL_FLOOR_MARGIN = 100;
+// RECALIBRATION_MS: how often to re-run calibration after the previous one finishes,
+// so the noise floor tracks a changing crowd/environment.
+static constexpr unsigned long RECALIBRATION_MS = 5UL * 60 * 1000;
 #endif
 
 static constexpr double SPEED_SOUND     = 343.0;
 static constexpr bool   INCL_EDGE       = false;
 // NCC_THRESHOLD: minimum normalized cross-correlation peak to accept a TDOA estimate.
 // Raise if random-direction readings persist; lower if real sounds are being rejected.
-static constexpr float  NCC_THRESHOLD   = 0.15f; // .15
+static constexpr float  NCC_THRESHOLD   = 0.25f;
 
 // CH_SKEW_US: within-cycle sampling delay per channel (12.5 µs/slot at 80 kHz).
 // Scan order CH0→CH3→CH6→CH7 means mic1 is sampled 12.5 µs after mic0, etc.
@@ -107,6 +118,13 @@ static bool          bg_capturing    = false;
 static bool          bg_align_to_ch0 = false;
 static int           bg_fill[4]      = {0};
 static unsigned long last_bg_ms      = 0;
+static bool          calibrating      = true;
+static long long     cal_sum          = 0;
+static long long     cal_sum2         = 0;   // sum of squares for 3-sigma threshold
+static long          cal_count        = 0;
+static int           dynamic_threshold = THRESHOLD;
+static unsigned long calibration_start_ms = 0;
+static unsigned long last_calibration_end_ms = 0; // used to schedule the next recalibration
 #endif
 
 // ── Cross-correlation TDOA ────────────────────────────────────────────────────
@@ -256,6 +274,15 @@ static Vector sound_direction() {
     for (int i = 0; i < 6; i++)
         if (magnitude(cones[i].n) > 0.5) guide = guide + cones[i].n;
 
+#if CROWDED_AREA
+    {
+        int valid = 0;
+        for (int i = 0; i < 6; i++)
+            if (magnitude(cones[i].n) > 0.5) valid++;
+        if (valid < 3) return Vector(0, 0, 0);
+    }
+#endif
+
     Vector candidates[13];
     int n = 0;
     for (int i = 0; i < 5; i++) {
@@ -329,7 +356,12 @@ void setup() {
     SYSCON.saradc_ctrl.sar1_patt_p_clear = 1;
     SYSCON.saradc_ctrl.sar1_patt_p_clear = 0;
 
+#if CROWDED_AREA
+    calibration_start_ms = millis();
+    Serial.println("calibrating...");
+#else
     Serial.println("ready");
+#endif
 }
 
 #if MODE == MODE_TEST
@@ -369,26 +401,57 @@ void loop() {
         const int val = (int)(raw & 0xFFF);
 
         if (!recording) {
-            const bool trigger = abs(val - VOLTAGE[m]) > THRESHOLD
-                                 && millis() - last_output_ms > COOLDOWN_MS;
 #if CROWDED_AREA
-            if (trigger) {
-                bg_capturing     = false;
-                recording        = true;
-                align_to_ch0     = true;
-                for (int i = 0; i < 4; i++) fill[i] = 0;
-            } else if (bg_capturing) {
-                if (bg_align_to_ch0) {
-                    if (m == 0) bg_align_to_ch0 = false; else { continue; }
+            if (calibrating) {
+                long dev = abs(val - VOLTAGE[m]);
+                cal_sum  += dev;
+                cal_sum2 += dev * dev;
+                cal_count++;
+                if (millis() - calibration_start_ms > CALIBRATION_MS) {
+                    if (cal_count > 0) {
+                        int avg     = (int)(cal_sum / cal_count);
+                        float var   = (float)(cal_sum2 / cal_count) - (float)avg * (float)avg;
+                        int std_dev = (int)sqrtf(var > 0.0f ? var : 0.0f);
+                        dynamic_threshold = avg + (int)(CAL_SIGMA_MULT * std_dev);
+                        if (dynamic_threshold < avg + CAL_FLOOR_MARGIN) dynamic_threshold = avg + CAL_FLOOR_MARGIN;
+                        Serial.printf("ready: avg=%d std=%d threshold=%d\n", avg, std_dev, dynamic_threshold);
+                    } else {
+                        dynamic_threshold = THRESHOLD;
+                        Serial.printf("ready: threshold=%d\n", dynamic_threshold);
+                    }
+                    calibrating          = false;
+                    last_calibration_end_ms = millis();
                 }
-                if (bg_fill[m] < SAMPLES) bg_buf[m][bg_fill[m]++] = val;
-            } else if (millis() - last_bg_ms > BG_UPDATE_MS
-                       && millis() - last_output_ms > COOLDOWN_MS) {
-                bg_capturing    = true;
-                bg_align_to_ch0 = true;
-                for (int i = 0; i < 4; i++) bg_fill[i] = 0;
+            } else {
+                const bool trigger = abs(val - VOLTAGE[m]) > dynamic_threshold
+                                     && millis() - last_output_ms > COOLDOWN_MS;
+                if (trigger) {
+                    bg_capturing     = false;
+                    recording        = true;
+                    align_to_ch0     = true;
+                    for (int i = 0; i < 4; i++) fill[i] = 0;
+                } else if (bg_capturing) {
+                    if (bg_align_to_ch0) {
+                        if (m == 0) bg_align_to_ch0 = false; else { continue; }
+                    }
+                    if (bg_fill[m] < SAMPLES) bg_buf[m][bg_fill[m]++] = val;
+                } else if (millis() - last_calibration_end_ms > RECALIBRATION_MS
+                           && millis() - last_output_ms > COOLDOWN_MS) {
+                    calibrating          = true;
+                    calibration_start_ms = millis();
+                    cal_sum = cal_sum2 = 0;
+                    cal_count            = 0;
+                    Serial.println("recalibrating...");
+                } else if (millis() - last_bg_ms > BG_UPDATE_MS
+                           && millis() - last_output_ms > COOLDOWN_MS) {
+                    bg_capturing    = true;
+                    bg_align_to_ch0 = true;
+                    for (int i = 0; i < 4; i++) bg_fill[i] = 0;
+                }
             }
 #else
+            const bool trigger = abs(val - VOLTAGE[m]) > THRESHOLD
+                                 && millis() - last_output_ms > COOLDOWN_MS;
             if (trigger) {
                 recording    = true;
                 align_to_ch0 = true;
@@ -422,6 +485,7 @@ void loop() {
     recording = false;
     last_output_ms = millis();
     Vector dir = sound_direction();
+    if (magnitude(dir) < 0.5) return;   // CROWDED_AREA: too few valid cone pairs
 #if MODE == MODE_ROS
     Serial.printf("Vector(%.4f,%.4f,%.4f)\n", dir.x, dir.y, dir.z);
 #else

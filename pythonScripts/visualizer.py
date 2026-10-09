@@ -23,6 +23,19 @@ PORT        = 'COM3'      # fallback if auto-detect finds nothing
 TRAIL_LEN   = 8           # number of ghost lines shown behind the current reading
 UPDATE_MS   = 50          # plot refresh interval in milliseconds
 
+DISPLAY_ROTATION_DEG = 90  # rotate the whole compass display clockwise ("to the right")
+
+def rotate_xy(x, y, deg=DISPLAY_ROTATION_DEG):
+    """Rotate a cartesian point clockwise by deg."""
+    rad = np.radians(deg)
+    c, s = np.cos(rad), np.sin(rad)
+    return x * c + y * s, -x * s + y * c
+
+def dir_xy(deg, r=1.0):
+    """Unit vector (scaled by r) for a compass angle, with display rotation applied."""
+    rad = np.radians(deg - DISPLAY_ROTATION_DEG)
+    return r * np.cos(rad), r * np.sin(rad)
+
 # Mic positions in metres — must match MIC_LOC order in main.cpp
 MIC_POS = np.array([
     [ 0.0625, -0.0625],   # MIC 1  VP  (GPIO 36)
@@ -30,6 +43,7 @@ MIC_POS = np.array([
     [-0.0625,  0.0625],   # MIC 3      (GPIO 34)
     [-0.0625, -0.0625],   # MIC 4      (GPIO 35)
 ])
+MIC_POS = np.array([rotate_xy(x, y) for x, y in MIC_POS])
 MIC_LABELS = ['1 (VP)', '2 (VN)', '3 (34)', '4 (35)']
 
 # ── Serial reader (background thread) ────────────────────────────────────────
@@ -76,14 +90,12 @@ for r, alpha in [(0.055, 0.25), (0.11, 0.35)]:
 
 # Cardinal tick marks and labels
 for deg in range(0, 360, 30):
-    rad = np.radians(deg)
     inner, outer = 0.108, 0.118
-    ax.plot([inner*np.cos(rad), outer*np.cos(rad)],
-            [inner*np.sin(rad), outer*np.sin(rad)],
+    ax.plot([dir_xy(deg, inner)[0], dir_xy(deg, outer)[0]],
+            [dir_xy(deg, inner)[1], dir_xy(deg, outer)[1]],
             color='white', alpha=0.4, lw=1)
 for deg, label in [(0,'0°'), (90,'90°'), (180,'180°'), (270,'270°')]:
-    rad = np.radians(deg)
-    ax.text(0.135*np.cos(rad), 0.135*np.sin(rad), label,
+    ax.text(*dir_xy(deg, 0.135), label,
             ha='center', va='center', fontsize=9, color='gray')
 
 # Microphone squares
@@ -123,8 +135,7 @@ def update(_):
         return [active_line, active_tip, angle_text] + trail_lines
 
     # Current reading
-    rad = np.radians(history[-1])
-    dx, dy = LINE_LEN * np.cos(rad), LINE_LEN * np.sin(rad)
+    dx, dy = dir_xy(history[-1], LINE_LEN)
     active_line.set_data([0, dx], [0, dy])
     active_tip.set_data([dx], [dy])
     angle_text.set_text(f'{history[-1]:.1f}°')
@@ -133,8 +144,8 @@ def update(_):
     past = list(history)[:-1]
     for i, ln in enumerate(trail_lines):
         if i < len(past):
-            r2 = np.radians(past[i])
-            ln.set_data([0, LINE_LEN*np.cos(r2)], [0, LINE_LEN*np.sin(r2)])
+            dx2, dy2 = dir_xy(past[i], LINE_LEN)
+            ln.set_data([0, dx2], [0, dy2])
         else:
             ln.set_data([], [])
 

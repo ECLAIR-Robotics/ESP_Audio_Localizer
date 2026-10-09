@@ -10,6 +10,11 @@
 - M3x18 Screws
 - M3 Nuts
 - 3mm Magnets
+### Parts to Print
+- Left Body x1
+- Right Body x1
+- ESP Mount x1
+- Mic Holder x4
 ## Microcontroller Code
 ### Structure
 ### Notable Constants
